@@ -21,6 +21,11 @@ internal sealed record Reading
     public float? GpuMemTemp { get; init; }
     public float? RamUsedGb { get; init; }
     public float? RamTotalGb { get; init; }
+    public float? RamLoad => RamUsedGb / RamTotalGb * 100;
+    public float? NetDown { get; init; }      // bytes/s
+    public float? NetUp { get; init; }
+    public float? DiskRead { get; init; }     // bytes/s
+    public float? DiskWrite { get; init; }
     public IReadOnlyList<(string Name, float Rpm)> Fans { get; init; } = Array.Empty<(string, float)>();
 }
 
@@ -32,6 +37,9 @@ internal sealed class SensorReader : IDisposable
     private readonly IHardware? _gpu;
     private readonly IHardware[] _boardChips;
     private readonly PerformanceCounter? _cpuUtility;
+    private readonly PerformanceCounter? _diskRead, _diskWrite;
+    private Dictionary<string, (long Rx, long Tx)> _netCounters = new();
+    private long _netStamp;
 
     public SensorReader()
     {
@@ -55,6 +63,69 @@ internal sealed class SensorReader : IDisposable
         {
             _cpuUtility = null;
         }
+
+        try
+        {
+            _diskRead = new PerformanceCounter("PhysicalDisk", "Disk Read Bytes/sec", "_Total");
+            _diskWrite = new PerformanceCounter("PhysicalDisk", "Disk Write Bytes/sec", "_Total");
+            _diskRead.NextValue();
+            _diskWrite.NextValue();
+        }
+        catch
+        {
+            _diskRead = _diskWrite = null;
+        }
+    }
+
+    /// <summary>
+    /// Download/upload rate summed over physical adapters. Counters are tracked per adapter, so an adapter
+    /// appearing or disappearing doesn't show up as a huge spike. Virtual adapters (Hyper-V switches, VPNs)
+    /// are skipped because their traffic also passes through a physical one.
+    /// </summary>
+    private (float? Down, float? Up) ReadNetwork()
+    {
+        var current = new Dictionary<string, (long Rx, long Tx)>();
+        try
+        {
+            foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (nic.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+                if (nic.NetworkInterfaceType is System.Net.NetworkInformation.NetworkInterfaceType.Loopback
+                    or System.Net.NetworkInformation.NetworkInterfaceType.Tunnel) continue;
+                if (nic.Description.Contains("Virtual", StringComparison.OrdinalIgnoreCase)
+                    || nic.Description.Contains("Pseudo", StringComparison.OrdinalIgnoreCase)) continue;
+                var stats = nic.GetIPStatistics();
+                current[nic.Id] = (stats.BytesReceived, stats.BytesSent);
+            }
+        }
+        catch
+        {
+            return (null, null);
+        }
+
+        long now = Stopwatch.GetTimestamp();
+        (float?, float?) rate = (null, null);
+        if (_netStamp != 0)
+        {
+            double seconds = (now - _netStamp) / (double)Stopwatch.Frequency;
+            long rx = 0, tx = 0;
+            foreach (var (id, c) in current)
+            {
+                if (!_netCounters.TryGetValue(id, out var p)) continue;
+                rx += Math.Max(0, c.Rx - p.Rx);
+                tx += Math.Max(0, c.Tx - p.Tx);
+            }
+            if (seconds > 0) rate = ((float)(rx / seconds), (float)(tx / seconds));
+        }
+        _netCounters = current;
+        _netStamp = now;
+        return rate;
+    }
+
+    private static float? Next(PerformanceCounter? counter)
+    {
+        try { return counter?.NextValue(); }
+        catch { return null; }
     }
 
     public string CpuName => _cpu?.Name ?? "?";
@@ -81,6 +152,7 @@ internal sealed class SensorReader : IDisposable
             ramTotal = mem.ullTotalPhys / 1073741824f;
             ramUsed = (mem.ullTotalPhys - mem.ullAvailPhys) / 1073741824f;
         }
+        var (netDown, netUp) = ReadNetwork();
 
         return new Reading
         {
@@ -100,6 +172,10 @@ internal sealed class SensorReader : IDisposable
             GpuMemTemp = Find(_gpu, SensorType.Temperature, "GPU Memory Junction")?.Value,
             RamUsedGb = ramUsed,
             RamTotalGb = ramTotal,
+            NetDown = netDown,
+            NetUp = netUp,
+            DiskRead = Next(_diskRead),
+            DiskWrite = Next(_diskWrite),
             Fans = _boardChips
                 .SelectMany(c => c.Sensors)
                 .Where(s => s.SensorType == SensorType.Fan && s.Value > 0)
@@ -170,6 +246,8 @@ internal sealed class SensorReader : IDisposable
     public void Dispose()
     {
         _cpuUtility?.Dispose();
+        _diskRead?.Dispose();
+        _diskWrite?.Dispose();
         _computer.Close();
     }
 }

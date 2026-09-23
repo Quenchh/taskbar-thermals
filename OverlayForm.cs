@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Drawing.Text;
-using System.Globalization;
 
 namespace TaskbarThermals;
 
@@ -24,11 +23,13 @@ internal sealed class OverlayForm : Form
     private readonly SpikeLogger _spikes;
     private readonly ProcessSampler _processes = new();
     private readonly SampleHistory _history = new();
+    private readonly MinuteHistory _minutes = new(Path.Combine(AppPaths.Dir, "history.csv"));
     private readonly StabilityMonitor _stability = new();
     private readonly SustainedAlert _cpuAlert = new();
     private readonly SustainedAlert _gpuAlert = new();
     private readonly ManualResetEvent _stop = new(false);
     private readonly System.Windows.Forms.Timer _placementTimer = new() { Interval = 250 };
+    private readonly System.Windows.Forms.Timer _updateTimer = new() { Interval = 24 * 60 * 60 * 1000 };
     private readonly ContextMenuStrip _menu = new() { ShowImageMargin = false, ShowCheckMargin = true };
     private readonly NotifyIcon _tray = new();
     private readonly Native.WinEventDelegate _winEventProc;
@@ -41,18 +42,23 @@ internal sealed class OverlayForm : Form
     private SettingsForm? _settingsForm;
     private bool _stabilityLoaded;
     private DateTime _lastStabilityNotice = DateTime.MinValue;
+    private Version? _update;
+    private string? _balloonUrl;
 
     private Reading _reading = Reading.Empty;
     private (float Value, DateTime At)? _maxCpu, _maxGpu;
 
     // Layout, in physical pixels.
+    private sealed record Line(Device Device, Metric[] Fields);
+    private sealed record Block(float LabelX, Line[] Lines, float[] ColumnRights, float[] ColumnWidths);
+
     private Rectangle _taskbar;
     private int _dpi;
     private bool _needsLayout = true;
     private Size _size;
     private Point _pos;
     private Font? _labelFont, _valueFont;
-    private float _colLabel, _colTempRight, _colLoadRight, _colPowerRight, _wLabel, _wTemp, _wLoad, _wPower;
+    private List<Block> _blocks = new();
 
     private bool _light = Theme.SystemUsesLightTheme();
     private bool _hover;
@@ -69,10 +75,13 @@ internal sealed class OverlayForm : Form
         StartPosition = FormStartPosition.Manual;
         AutoScaleMode = AutoScaleMode.None;
         Text = "Taskbar Thermals";
+        L.Apply(_settings.Language);
 
         _spikes = new SpikeLogger(() => _settings);
+        _minutes.Load();
         _winEventProc = (_, _, _, _, _, _, _) => UpdatePlacement();
         _placementTimer.Tick += (_, _) => UpdatePlacement();
+        _updateTimer.Tick += (_, _) => CheckForUpdates();
 
         _menu.Opening += (_, e) =>
         {
@@ -83,6 +92,7 @@ internal sealed class OverlayForm : Form
         _tray.Text = "Taskbar Thermals";
         _tray.ContextMenuStrip = _menu;
         _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) TogglePanel(); };
+        _tray.BalloonTipClicked += (_, _) => { if (_balloonUrl != null) OpenUrl(_balloonUrl); };
 
         _stability.EventLogged += ev => Post(() => OnStabilityEvent(ev));
     }
@@ -109,21 +119,25 @@ internal sealed class OverlayForm : Form
         _winEventHook = Native.SetWinEventHook(Native.EVENT_SYSTEM_FOREGROUND, Native.EVENT_SYSTEM_FOREGROUND,
             IntPtr.Zero, _winEventProc, 0, 0, Native.WINEVENT_OUTOFCONTEXT);
         _placementTimer.Start();
+        _updateTimer.Start();
 
         _worker = new Thread(WorkerLoop) { IsBackground = true, Name = "Sensors" };
         _worker.Start();
 
         Task.Run(() => _stability.Start(TimeSpan.FromDays(7))).ContinueWith(_ => Post(OnStabilityLoaded));
+        Task.Delay(TimeSpan.FromMinutes(1)).ContinueWith(_ => Post(CheckForUpdates));
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         _placementTimer.Stop();
+        _updateTimer.Stop();
         if (_winEventHook != IntPtr.Zero) Native.UnhookWinEvent(_winEventHook);
         _tray.Visible = false;
         _tray.Dispose();
         _stop.Set();
         _worker?.Join(3000);
+        _minutes.Flush();
         _sensors?.Dispose();
         _processes.Dispose();
         _stability.Dispose();
@@ -175,25 +189,52 @@ internal sealed class OverlayForm : Form
         if (IsDisposed) return;
         _reading = r;
         _history.Add(at, r);
+        _minutes.Add(at, r);
         if (r.CpuTemp is float c && (_maxCpu is null || c > _maxCpu.Value.Value)) _maxCpu = (c, at);
         if (r.GpuTemp is float g && (_maxGpu is null || g > _maxGpu.Value.Value)) _maxGpu = (g, at);
         _light = Theme.SystemUsesLightTheme();
 
         if (_settings.AlertCpu && _cpuAlert.Check(at, r.CpuTemp, _settings.AlertCpuTemp, _settings.AlertSeconds))
-            Notify("CPU running hot", $"CPU at {r.CpuTemp:0}°C, above {_settings.AlertCpuTemp}°C for {_settings.AlertSeconds} seconds.", ToolTipIcon.Warning);
+            Notify(L.CpuHotTitle, L.HotText("CPU", r.CpuTemp!.Value, _settings.AlertCpuTemp, _settings.AlertSeconds), ToolTipIcon.Warning);
         if (_settings.AlertGpu && _gpuAlert.Check(at, r.GpuTemp, _settings.AlertGpuTemp, _settings.AlertSeconds))
-            Notify("GPU running hot", $"GPU at {r.GpuTemp:0}°C, above {_settings.AlertGpuTemp}°C for {_settings.AlertSeconds} seconds.", ToolTipIcon.Warning);
+            Notify(L.GpuHotTitle, L.HotText("GPU", r.GpuTemp!.Value, _settings.AlertGpuTemp, _settings.AlertSeconds), ToolTipIcon.Warning);
 
-        _tray.Text = $"Taskbar Thermals\nCPU {TempText(r.CpuTemp)}  {LoadText(r.CpuLoad)}%\nGPU {TempText(r.GpuTemp)}  {LoadText(r.GpuLoad)}%";
+        _tray.Text = $"Taskbar Thermals\nCPU {TempText(r.CpuTemp)}  {LoadText(r.CpuLoad)}\nGPU {TempText(r.GpuTemp)}  {LoadText(r.GpuLoad)}";
         Render();
         RefreshPanel();
     }
 
     private static string TempText(float? t) => t is float v ? $"{v:0}°C" : "--";
-    private static string LoadText(float? l) => l is float v ? $"{v:0}" : "--";
-    private static string When(DateTime t) => t.ToString("MMM d, HH:mm", CultureInfo.InvariantCulture);
+    private static string LoadText(float? l) => l is float v ? L.Percent(v) : "--";
 
-    private void Notify(string title, string text, ToolTipIcon icon) => _tray.ShowBalloonTip(10_000, title, text, icon);
+    private void Notify(string title, string text, ToolTipIcon icon, string? url = null)
+    {
+        _balloonUrl = url;
+        _tray.ShowBalloonTip(10_000, title, text, icon);
+    }
+
+    // ---------------------------------------------------------------- updates
+
+    private async void CheckForUpdates()
+    {
+        if (!_settings.CheckUpdates || IsDisposed) return;
+        var newer = await UpdateChecker.FindNewerAsync();
+        if (newer == null || IsDisposed) return;
+
+        _update = newer;
+        string tag = $"v{newer}";
+        if (_settings.UpdateNotified == tag) return;
+        _settings.UpdateNotified = tag;
+        _settings.Save();
+        Notify(L.UpdateTitle, L.UpdateText(tag), ToolTipIcon.Info, UpdateChecker.ReleasesPage);
+    }
+
+    /// <summary>Opens a URL through Explorer so the browser doesn't inherit our administrator rights.</summary>
+    private static void OpenUrl(string url)
+    {
+        try { Process.Start("explorer.exe", $"\"{url}\""); }
+        catch (Exception ex) { AppPaths.LogError(ex); }
+    }
 
     // ---------------------------------------------------------------- stability
 
@@ -206,12 +247,7 @@ internal sealed class OverlayForm : Form
         DateTime since = Later(_settings.StabilityAckTime, _settings.StabilityNotifiedUntil);
         var fresh = _stability.Since(since).Where(e => e.Serious).ToList();
         if (_settings.AlertStability && fresh.Count > 0)
-        {
-            string text = fresh.Count == 1
-                ? $"{fresh[0].Title} ({When(fresh[0].Time)})."
-                : $"{fresh.Count} events. Latest: {fresh[0].Title} ({When(fresh[0].Time)}).";
-            Notify("Stability warning", text, ToolTipIcon.Error);
-        }
+            Notify(L.StabilityTitle, L.StabilitySummary(fresh.Count, fresh[0].Title, fresh[0].Time), ToolTipIcon.Error);
         MarkStabilityNotified();
     }
 
@@ -221,9 +257,7 @@ internal sealed class OverlayForm : Form
         if (_settings.AlertStability && ev.Serious && DateTime.Now - _lastStabilityNotice > TimeSpan.FromMinutes(10))
         {
             _lastStabilityNotice = DateTime.Now;
-            Notify("Stability warning",
-                $"{ev.Title} at {ev.Time:HH:mm}. A recent BIOS change (undervolt, Curve Optimizer, SoC voltage) may be unstable.",
-                ToolTipIcon.Error);
+            Notify(L.StabilityTitle, L.StabilityLive(ev.Title, ev.Time), ToolTipIcon.Error);
         }
         MarkStabilityNotified();
     }
@@ -271,6 +305,12 @@ internal sealed class OverlayForm : Form
         panel.SpikeLogClicked += ShowSpikeLog;
         panel.SettingsClicked += OpenSettings;
         panel.StabilityAckClicked += AcknowledgeStability;
+        panel.RangeChanged += range =>
+        {
+            _settings.HistoryRange = range;
+            _settings.Save();
+            RefreshPanel();
+        };
         return panel;
     }
 
@@ -282,6 +322,7 @@ internal sealed class OverlayForm : Form
     private PanelState BuildPanelState() => new(
         _reading,
         _history.Samples,
+        _minutes.Minutes,
         _sensors?.CpuName ?? "CPU",
         _sensors?.GpuName ?? "GPU",
         _maxCpu,
@@ -307,13 +348,16 @@ internal sealed class OverlayForm : Form
             _settingsForm = null;
             if (!form.Saved) return;
 
-            // Fields the dialog doesn't own may have changed while it was open (dragging, stability acks).
+            // Fields the dialog doesn't own may have changed while it was open (dragging, stability acks, panel range).
             var s = form.Result;
             s.OffsetFromRight = _settings.OffsetFromRight;
             s.StabilityAckTime = _settings.StabilityAckTime;
             s.StabilityNotifiedUntil = _settings.StabilityNotifiedUntil;
+            s.HistoryRange = _settings.HistoryRange;
+            s.UpdateNotified = _settings.UpdateNotified;
             _settings = s;
             _settings.Save();
+            L.Apply(_settings.Language);
 
             _needsLayout = true;
             UpdatePlacement();
@@ -382,7 +426,7 @@ internal sealed class OverlayForm : Form
         }
         else
         {
-            // Default: just left of the notification area (the ^ / ENG / clock block).
+            // Default: just left of the notification area (the ^ / language / clock block).
             IntPtr notify = Native.FindWindowEx(tray, IntPtr.Zero, "TrayNotifyWnd", null);
             x = notify != IntPtr.Zero && Native.GetWindowRect(notify, out var nr) && nr.Right > nr.Left && nr.Left > _taskbar.Left + _taskbar.Width / 2
                 ? nr.Left - _size.Width - Px(8)
@@ -407,6 +451,10 @@ internal sealed class OverlayForm : Form
     private int Px(int v) => (int)Math.Round(v * _dpi / 96.0);
     private float Px(float v) => v * _dpi / 96f;
 
+    /// <summary>
+    /// One line per device that has at least one selected metric (CPU, GPU, RAM, NET, DISK), stacked two per block;
+    /// blocks sit side by side. Columns are sized from each metric's widest possible text so values don't jitter.
+    /// </summary>
     private void Relayout()
     {
         _labelFont?.Dispose();
@@ -414,19 +462,38 @@ internal sealed class OverlayForm : Form
         _labelFont = new Font("Segoe UI", Px(_settings.FontSize - 1f), FontStyle.Regular, GraphicsUnit.Pixel);
         _valueFont = new Font("Segoe UI Semibold", Px((float)_settings.FontSize), FontStyle.Regular, GraphicsUnit.Pixel);
 
+        var selected = _settings.Metrics is { Count: > 0 } m ? m : Metrics.Defaults.ToList();
+        var lines = Enum.GetValues<Device>()
+            .Select(d => new Line(d, Metrics.All.Where(x => x.Device == d && selected.Contains(x.Id)).ToArray()))
+            .Where(l => l.Fields.Length > 0)
+            .ToList();
+        if (lines.Count == 0) lines.Add(new Line(Device.Cpu, new[] { Metrics.All[0] }));
+
         using var probe = new Bitmap(1, 1);
         using var g = Graphics.FromImage(probe);
         g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-        _wLabel = Measure(g, "GPU", _labelFont);
-        _wTemp = Measure(g, "100°C", _valueFont);
-        _wLoad = Measure(g, "100%", _valueFont);
-        _wPower = Measure(g, "000W", _valueFont);
 
-        float pad = Px(8f), gap = Px(7f);
-        _colLabel = pad;
-        float x = _colTempRight = pad + _wLabel + gap + _wTemp;
-        if (_settings.ShowLoad) x = _colLoadRight = x + gap + _wLoad;
-        if (_settings.ShowPower) x = _colPowerRight = x + gap + _wPower;
+        float pad = Px(8f), gap = Px(7f), blockGap = Px(14f);
+        float x = pad;
+        _blocks = new List<Block>();
+        foreach (var pair in lines.Chunk(2))
+        {
+            float labelX = x;
+            x += pair.Max(l => Measure(g, Metrics.DeviceLabel(l.Device), _labelFont));
+            int columns = pair.Max(l => l.Fields.Length);
+            var widths = new float[columns];
+            var rights = new float[columns];
+            for (int c = 0; c < columns; c++)
+            {
+                int col = c;
+                widths[c] = pair.Where(l => col < l.Fields.Length).Max(l => Measure(g, l.Fields[col].Template(), _valueFont));
+                x += gap + widths[c];
+                rights[c] = x;
+            }
+            _blocks.Add(new Block(labelX, pair, rights, widths));
+            x += blockGap;
+        }
+        x -= blockGap;
         _size = new Size((int)Math.Ceiling(x + pad), Math.Max(Px(24), _taskbar.Height));
     }
 
@@ -455,8 +522,14 @@ internal sealed class OverlayForm : Form
             }
 
             float rowOffset = Px(_settings.FontSize * 0.667f);
-            DrawRow(g, _size.Height / 2f - rowOffset, "CPU", _reading.CpuTemp, _reading.CpuLoad, _reading.CpuPower, _settings.CpuWarn, _settings.CpuHot);
-            DrawRow(g, _size.Height / 2f + rowOffset, "GPU", _reading.GpuTemp, _reading.GpuLoad, _reading.GpuPower, _settings.GpuWarn, _settings.GpuHot);
+            foreach (var block in _blocks)
+            {
+                for (int i = 0; i < block.Lines.Length; i++)
+                {
+                    float centerY = block.Lines.Length == 1 ? _size.Height / 2f : _size.Height / 2f + (i == 0 ? -rowOffset : rowOffset);
+                    DrawLine(g, block, block.Lines[i], centerY);
+                }
+            }
 
             // Unacknowledged hardware errors: a small red dot; the panel carries the icon + label explanation.
             if (OpenStabilityEvents().Any(e => e.Serious))
@@ -470,32 +543,31 @@ internal sealed class OverlayForm : Form
         Native.UpdateLayered(Handle, bmp, _pos);
     }
 
-    private void DrawRow(Graphics g, float centerY, string label, float? temp, float? load, float? power, float warn, float hot)
+    private void DrawLine(Graphics g, Block block, Line line, float centerY)
     {
         float rowH = Px(_settings.FontSize + 4f);
         float top = centerY - rowH / 2;
 
         Color text = _light ? Color.FromArgb(255, 26, 26, 26) : Color.White;
         Color dim = _light ? Color.FromArgb(150, 0, 0, 0) : Color.FromArgb(165, 255, 255, 255);
-        Color tempColor = temp switch
-        {
-            float t when t >= hot => _light ? Color.FromArgb(196, 43, 28) : Color.FromArgb(255, 107, 107),
-            float t when t >= warn => _light ? Color.FromArgb(157, 93, 0) : Color.FromArgb(255, 200, 61),
-            _ => text,
-        };
 
         using var dimBrush = new SolidBrush(dim);
-        using var tempBrush = new SolidBrush(tempColor);
-        using var textBrush = new SolidBrush(text);
+        string label = Metrics.DeviceLabel(line.Device);
+        g.DrawString(label, _labelFont!, dimBrush, new RectangleF(block.LabelX, top, Measure(g, label, _labelFont!) + Px(4f), rowH), LeftFormat);
 
-        RectangleF Column(float right, float width) => new(right - width - Px(4f), top, width + Px(4f), rowH);
-
-        g.DrawString(label, _labelFont!, dimBrush, new RectangleF(_colLabel, top, _wLabel + Px(4f), rowH), LeftFormat);
-        g.DrawString(temp is float tv ? $"{tv:0}°C" : "--°C", _valueFont!, tempBrush, Column(_colTempRight, _wTemp), RightFormat);
-        if (_settings.ShowLoad)
-            g.DrawString(load is float lv ? $"{lv:0}%" : "--%", _valueFont!, textBrush, Column(_colLoadRight, _wLoad), RightFormat);
-        if (_settings.ShowPower)
-            g.DrawString(power is float pv ? $"{pv:0}W" : "--W", _valueFont!, textBrush, Column(_colPowerRight, _wPower), RightFormat);
+        for (int c = 0; c < line.Fields.Length; c++)
+        {
+            var metric = line.Fields[c];
+            Color color = text;
+            if (Metrics.Thresholds(metric, _settings) is var (warn, hot) && Metrics.RawValue(metric, _reading) is float v)
+            {
+                if (v >= hot) color = _light ? Color.FromArgb(196, 43, 28) : Color.FromArgb(255, 107, 107);
+                else if (v >= warn) color = _light ? Color.FromArgb(157, 93, 0) : Color.FromArgb(255, 200, 61);
+            }
+            using var brush = new SolidBrush(color);
+            var rect = new RectangleF(block.ColumnRights[c] - block.ColumnWidths[c] - Px(4f), top, block.ColumnWidths[c] + Px(4f), rowH);
+            g.DrawString(metric.Format(_reading), _valueFont!, brush, rect, RightFormat);
+        }
     }
 
     private static StringFormat MakeFormat(StringAlignment alignment)
@@ -591,23 +663,29 @@ internal sealed class OverlayForm : Form
         _menu.Items.Clear();
         _menu.Renderer = _light ? new ToolStripProfessionalRenderer() : new DarkMenuRenderer();
 
-        AddInfo($"Max CPU: {FormatMax(_maxCpu)}     Max GPU: {FormatMax(_maxGpu)}");
-        AddInfo(_spikes.Last is { } last ? $"Last spike: {last}" : "No spikes logged yet");
+        if (_update is { } update)
+        {
+            _menu.Items.Add(L.MenuUpdate($"v{update}"), null, (_, _) => OpenUrl(UpdateChecker.ReleasesPage));
+            _menu.Items.Add(new ToolStripSeparator());
+        }
+
+        AddInfo(L.MenuMax(FormatMax(_maxCpu), FormatMax(_maxGpu)));
+        AddInfo(_spikes.Last is { } last ? L.MenuLastSpike(last) : L.MenuNoSpikes);
         var open = OpenStabilityEvents();
-        if (open.Count > 0) AddInfo($"Stability: {open.Count} event(s), latest: {open[0].Title}");
+        if (open.Count > 0) AddInfo(L.MenuStability(open.Count, open[0].Title));
         if (_sensorsFailed || (_sensors != null && _reading.CpuTemp is null && _reading.CpuLoad is not null))
-            AddInfo("Can't read CPU temperature — run as administrator");
+            AddInfo(L.MenuNoCpuTemp);
         _menu.Items.Add(new ToolStripSeparator());
 
-        _menu.Items.Add("Details", null, (_, _) => TogglePanel());
-        _menu.Items.Add("Task Manager", null, (_, _) => OpenTaskManager());
-        var log = _menu.Items.Add("Show spike log", null, (_, _) => ShowSpikeLog());
+        _menu.Items.Add(L.MenuDetails, null, (_, _) => TogglePanel());
+        _menu.Items.Add(L.TaskManager, null, (_, _) => OpenTaskManager());
+        var log = _menu.Items.Add(L.MenuShowSpikeLog, null, (_, _) => ShowSpikeLog());
         log.Enabled = File.Exists(_spikes.LogPath);
-        _menu.Items.Add("Settings…", null, (_, _) => OpenSettings());
+        _menu.Items.Add(L.MenuSettings, null, (_, _) => OpenSettings());
         _menu.Items.Add(new ToolStripSeparator());
 
-        _menu.Items.Add("Reset max values", null, (_, _) => { _maxCpu = null; _maxGpu = null; });
-        var reset = _menu.Items.Add("Reset position", null, (_, _) =>
+        _menu.Items.Add(L.MenuResetMax, null, (_, _) => { _maxCpu = null; _maxGpu = null; });
+        var reset = _menu.Items.Add(L.MenuResetPosition, null, (_, _) =>
         {
             _settings.OffsetFromRight = null;
             _settings.Save();
@@ -616,12 +694,12 @@ internal sealed class OverlayForm : Form
         reset.Enabled = _settings.OffsetFromRight is not null;
 
         _startupEnabled ??= Startup.IsEnabled();
-        var startup = new ToolStripMenuItem("Start with Windows") { Checked = _startupEnabled.Value };
+        var startup = new ToolStripMenuItem(L.StartWithWindows) { Checked = _startupEnabled.Value };
         startup.Click += (_, _) => ToggleStartup();
         _menu.Items.Add(startup);
 
         _menu.Items.Add(new ToolStripSeparator());
-        _menu.Items.Add("Exit", null, (_, _) => Close());
+        _menu.Items.Add(L.MenuExit, null, (_, _) => Close());
 
         if (!_light)
             foreach (ToolStripItem item in _menu.Items) item.ForeColor = Color.White;
@@ -636,9 +714,7 @@ internal sealed class OverlayForm : Form
     {
         bool ok = _startupEnabled == true ? Startup.Disable() : Startup.Enable();
         _startupEnabled = Startup.IsEnabled();
-        if (!ok)
-            MessageBox.Show("Couldn't update the Task Scheduler entry. Make sure the app is running as administrator.",
-                "Taskbar Thermals", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        if (!ok) MessageBox.Show(L.StartupFailed, "Taskbar Thermals", MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
 
     private void ShowSpikeLog()

@@ -1,21 +1,22 @@
 # Taskbar Thermals
 
-Live CPU and GPU temperature and usage right on the Windows 11 taskbar — plus a 10-minute history panel, temperature-spike logging and a hardware-error watcher for when you're tuning undervolts or BIOS settings.
+Live CPU and GPU temperature and usage right on the Windows 11 taskbar — plus RAM, network and disk if you want them, a 24-hour history panel, temperature-spike logging and a hardware-error watcher for when you're tuning undervolts or BIOS settings.
 
 ![Taskbar overlay](docs/taskbar.png)
 
-<img src="docs/panel.png" alt="Details panel" width="380"> <img src="docs/settings.png" alt="Settings" width="380">
+<img src="docs/demo.gif" alt="Details panel: hovering the charts and switching between 10 minutes, 1 hour and 24 hours" width="380"> <img src="docs/settings.png" alt="Settings" width="380">
 
-*Details panel and settings. The chart history in the panel screenshot is generated sample data.*
+*Details panel and settings. The chart history in the animation is generated sample data.*
 
 ## Features
 
-- **Taskbar overlay** — CPU/GPU temperature, usage and (optionally) power draw, updated every second. Temperatures turn yellow/red past your thresholds. Hides automatically for full-screen games and videos, just like the taskbar.
-- **Details panel** (click the overlay) — current temperature, usage, power and clocks; 10-minute temperature and usage charts with hover readouts; SoC voltage, Vcore, fan speeds, RAM; max temperatures.
+- **Taskbar overlay** — pick what it shows: CPU/GPU temperature, usage, power and clock, GPU memory temperature, RAM usage, network download/upload, disk read/write. Temperatures turn yellow/red past your thresholds. Hides automatically for full-screen games and videos, just like the taskbar.
+- **Details panel** (click the overlay) — current temperature, usage, power and clocks; temperature and usage charts for the last 10 minutes, hour or 24 hours with hover readouts; SoC voltage, Vcore, fan speeds, RAM, network, disk; max temperatures. The 24-hour history survives restarts.
 - **Spike log** — when the CPU temperature jumps quickly (default: 10 °C within 5 s), the busiest processes at that moment are written to a CSV, so you can see what caused it.
 - **Stability watcher** — watches the Windows event log for WHEA hardware errors, blue screens and unexpected shutdowns, and notifies you. Useful when testing Curve Optimizer, SoC voltage or memory settings: press *Mark as seen* before a test, and any new event belongs to the new setting.
 - **Notifications** when the CPU or GPU stays above a temperature for too long.
-- Dark and light theme, per-monitor DPI aware, drag to reposition, starts with Windows.
+- **Update check** — once a day, tells you when a new release is out.
+- English and Turkish UI (follows the Windows display language, or pick one in settings), dark and light theme, per-monitor DPI aware, drag to reposition, starts with Windows.
 
 ## Requirements
 
@@ -64,6 +65,7 @@ Everything lives in `%LOCALAPPDATA%\TaskbarThermals`:
 |---|---|
 | `settings.json` | Settings |
 | `spikes.csv` | Temperature spikes with the top CPU processes at that moment |
+| `history.csv` | Per-minute average, min and max of CPU/GPU temperature and usage for the last 24 hours |
 | `errors.log` | Unexpected errors |
 
 ## Diagnostics
@@ -71,7 +73,16 @@ Everything lives in `%LOCALAPPDATA%\TaskbarThermals`:
 ```powershell
 TaskbarThermals.exe --dump sensors.txt   # every sensor + a 20 s series of CPU power/temperature/fan speeds
 TaskbarThermals.exe --preview <folder>   # renders the details panel and settings window to PNGs
+TaskbarThermals.exe --demo <folder>      # renders the frames of the README animation
 ```
+
+## Privacy
+
+Nothing leaves your PC except the optional update check: one HTTPS request shortly after start and then once a day to the GitHub API (`api.github.com/repos/Quenchh/taskbar-thermals/releases/latest`) with no data attached. Turn it off in settings.
+
+## Releases
+
+Pushing a `v*` tag builds both executables on GitHub Actions and publishes a release with checksums; notes come from [CHANGELOG.md](CHANGELOG.md).
 
 ## How it works
 

@@ -136,6 +136,47 @@ internal static class Native
     [DllImport("dwmapi.dll")]
     private static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out RECT value, int size);
 
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
+
+    /// <summary>
+    /// Renders one window (frame included) into a bitmap without reading the screen, so nothing else on the
+    /// desktop can end up in the picture. Corners outside Windows 11's rounded frame are made transparent.
+    /// </summary>
+    public static Bitmap CaptureWindow(IntPtr hwnd, int dpi)
+    {
+        GetWindowRect(hwnd, out var wr);
+        var window = wr.ToRectangle();
+        var visible = VisibleBounds(hwnd);
+        if (visible.IsEmpty) visible = window;
+
+        using var full = new Bitmap(window.Width, window.Height, PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(full))
+        {
+            IntPtr hdc = g.GetHdc();
+            try { PrintWindow(hwnd, hdc, 2 /* PW_RENDERFULLCONTENT */); }
+            finally { g.ReleaseHdc(hdc); }
+        }
+
+        var crop = new Rectangle(visible.X - window.X, visible.Y - window.Y, visible.Width, visible.Height);
+        var result = new Bitmap(crop.Width, crop.Height, PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(result))
+        using (var texture = new TextureBrush(full, crop))
+        using (var path = new System.Drawing.Drawing2D.GraphicsPath())
+        {
+            float d = 16f * dpi / 96f, w = crop.Width - 1, h = crop.Height - 1;
+            path.AddArc(0, 0, d, d, 180, 90);
+            path.AddArc(w - d, 0, d, d, 270, 90);
+            path.AddArc(w - d, h - d, d, d, 0, 90);
+            path.AddArc(0, h - d, d, d, 90, 90);
+            path.CloseFigure();
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.FillPath(texture, path);
+        }
+        return result;
+    }
+
     /// <summary>The window's visible frame, without the invisible resize borders that GetWindowRect includes.</summary>
     public static Rectangle VisibleBounds(IntPtr hwnd) =>
         DwmGetWindowAttribute(hwnd, 9 /* DWMWA_EXTENDED_FRAME_BOUNDS */, out var r, Marshal.SizeOf<RECT>()) == 0

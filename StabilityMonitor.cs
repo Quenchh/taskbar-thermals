@@ -2,7 +2,13 @@ using System.Diagnostics.Eventing.Reader;
 
 namespace TaskbarThermals;
 
-internal sealed record StabilityEvent(long Id, DateTime Time, string Title, bool Serious);
+internal enum StabilityKind { Whea, UnexpectedShutdown, BugCheck }
+
+/// <summary>A stability-relevant event; the display text comes from <see cref="L.EventTitle"/> so it follows the UI language.</summary>
+internal sealed record StabilityEvent(long Id, DateTime Time, StabilityKind Kind, int WheaId, bool Serious)
+{
+    public string Title => L.EventTitle(this);
+}
 
 /// <summary>
 /// Watches the System event log for the usual signs of an unstable undervolt / memory setting:
@@ -79,17 +85,10 @@ internal sealed class StabilityMonitor : IDisposable
         var time = r.TimeCreated ?? DateTime.Now;
         return r.ProviderName switch
         {
-            "Microsoft-Windows-WHEA-Logger" => r.Id switch
-            {
-                18 => new(id, time, "Fatal hardware error (WHEA 18)", true),
-                19 => new(id, time, "Corrected CPU error (WHEA 19)", true),
-                47 => new(id, time, "Corrected memory error (WHEA 47)", true),
-                // Corrected PCIe errors are often link-level noise; list them but don't raise an alarm.
-                17 => new(id, time, "Corrected PCIe error (WHEA 17)", false),
-                _ => new(id, time, $"Hardware error (WHEA {r.Id})", true),
-            },
-            "Microsoft-Windows-Kernel-Power" => new(id, time, "Unexpected shutdown or restart", true),
-            _ => new(id, time, "Blue screen (BugCheck)", true),
+            // Corrected PCIe errors (17) are often link-level noise; list them but don't raise an alarm.
+            "Microsoft-Windows-WHEA-Logger" => new(id, time, StabilityKind.Whea, r.Id, Serious: r.Id != 17),
+            "Microsoft-Windows-Kernel-Power" => new(id, time, StabilityKind.UnexpectedShutdown, 0, true),
+            _ => new(id, time, StabilityKind.BugCheck, 0, true),
         };
     }
 

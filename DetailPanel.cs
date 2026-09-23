@@ -1,6 +1,5 @@
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
-using System.Globalization;
 
 namespace TaskbarThermals;
 
@@ -8,6 +7,7 @@ namespace TaskbarThermals;
 internal sealed record PanelState(
     Reading Reading,
     IReadOnlyList<Sample> History,
+    IReadOnlyList<MinuteSample> Minutes,
     string CpuName,
     string GpuName,
     (float Value, DateTime At)? MaxCpu,
@@ -18,17 +18,19 @@ internal sealed record PanelState(
     bool SpikeLogExists,
     Settings Settings);
 
-/// <summary>Flyout above the taskbar overlay: current values, 10-minute charts, board sensors and stability status.</summary>
+/// <summary>Flyout above the taskbar overlay: current values, history charts, board sensors and stability status.</summary>
 internal sealed class DetailPanel : Form
 {
     private const float WidthDip = 380;
     private const float PadDip = 16;
-    private static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
 
-    private sealed record ChartSpec(string Title, bool Percent, Func<Reading, float?> Cpu, Func<Reading, float?> Gpu);
+    private sealed record ChartSpec(bool Percent, Func<Reading, float?> Cpu, Func<Reading, float?> Gpu, Func<MinuteSample, MinuteStat?> CpuMinute, Func<MinuteSample, MinuteStat?> GpuMinute);
 
-    private static readonly ChartSpec TempChart = new("Temperature", false, r => r.CpuTemp, r => r.GpuTemp);
-    private static readonly ChartSpec LoadChart = new("Usage", true, r => r.CpuLoad, r => r.GpuLoad);
+    private static readonly ChartSpec TempChart = new(false, r => r.CpuTemp, r => r.GpuTemp, m => m.CpuTemp, m => m.GpuTemp);
+    private static readonly ChartSpec LoadChart = new(true, r => r.CpuLoad, r => r.GpuLoad, m => m.CpuLoad, m => m.GpuLoad);
+
+    /// <summary>One pixel column of a chart: the average line plus the min–max band.</summary>
+    private readonly record struct Bucket(DateTime Time, float Avg, float Min, float Max, bool Has);
 
     private readonly record struct Tile(string Label, string Value, string? Prefix = null, string? Suffix = null, Color? Status = null);
 
@@ -41,15 +43,17 @@ internal sealed class DetailPanel : Form
     public event Action? SpikeLogClicked;
     public event Action? SettingsClicked;
     public event Action? StabilityAckClicked;
+    public event Action<HistoryRange>? RangeChanged;
 
     private PanelState? _state;
     private Theme _theme = Theme.Current;
     private int _fontDpi;
     private Font? _fHeader, _fTitle, _fText, _fSmall, _fAxis, _fValue;
 
-    // Hit targets recorded during the last paint.
+    // Hit targets and chart areas recorded during the last paint.
     private readonly List<(RectangleF Rect, Action Click, bool Enabled)> _buttons = new();
-    private RectangleF _tempPlot;
+    private readonly List<RectangleF> _plots = new();
+    private readonly Dictionary<HistoryRange, RectangleF> _rangeButtons = new();
     private Point? _mouse;
 
     public DetailPanel()
@@ -116,24 +120,30 @@ internal sealed class DetailPanel : Form
         Hide();
     }
 
-    /// <summary>
-    /// Renders the current state off-screen (used by the --preview diagnostics mode).
-    /// <paramref name="hover"/> simulates the mouse over the temperature chart at that fraction of its width.
-    /// </summary>
-    public Bitmap Snapshot(float? hover = null)
+    /// <summary>Renders the current state off-screen, optionally with the mouse at <paramref name="mouse"/> (--preview / --demo).</summary>
+    public Bitmap Snapshot(Point? mouse = null)
     {
         FitHeight();
         var bmp = new Bitmap(ClientSize.Width, ClientSize.Height);
         using var g = Graphics.FromImage(bmp);
-        if (hover is float f)
-        {
-            _mouse = null;
-            PaintAll(g); // records the chart rectangles
-            _mouse = new Point((int)(_tempPlot.Left + _tempPlot.Width * f), (int)(_tempPlot.Top + _tempPlot.Height / 2));
-        }
+        _mouse = mouse;
         PaintAll(g);
         _mouse = null;
         return bmp;
+    }
+
+    /// <summary>A point inside chart <paramref name="index"/> (0 = temperature, 1 = usage) as of the last render.</summary>
+    public Point ChartPoint(int index, float fx, float fy)
+    {
+        var p = _plots[index];
+        return new Point((int)(p.Left + p.Width * fx), (int)(p.Top + p.Height * fy));
+    }
+
+    /// <summary>Center of a history range button as of the last render.</summary>
+    public Point RangeButton(HistoryRange range)
+    {
+        var r = _rangeButtons[range];
+        return new Point((int)(r.Left + r.Width / 2), (int)(r.Top + r.Height / 2));
     }
 
     protected override void OnDeactivate(EventArgs e)
@@ -273,11 +283,14 @@ internal sealed class DetailPanel : Form
         g.FillPath(brush, path);
     }
 
+    private bool Hovered(RectangleF r) => _mouse is Point m && r.Contains(m);
+
     // ---------------------------------------------------------------- content
 
     private float DrawContent(Graphics g)
     {
         _buttons.Clear();
+        _plots.Clear();
         float pad = Pf(PadDip);
         if (_state is not { } s) return pad * 2;
         var r = s.Reading;
@@ -287,23 +300,24 @@ internal sealed class DetailPanel : Form
         y = DrawDevice(g, y, "CPU", s.CpuName, new[]
         {
             TempTile(r.CpuTemp, set.CpuWarn, set.CpuHot),
-            new Tile("Usage", Num(r.CpuLoad, "0"), Suffix: "%"),
-            new Tile("Power", Num(r.CpuPower, "0"), Suffix: " W"),
-            new Tile("Clock", Num(r.CpuClock / 1000, "0.0"), Suffix: " GHz"),
+            PercentTile(L.Usage, r.CpuLoad),
+            new Tile(L.Power, Num(r.CpuPower, "0"), Suffix: " W"),
+            new Tile(L.Clock, Num(r.CpuClock / 1000, "0.0"), Suffix: " GHz"),
         });
         y += Pf(14);
         y = DrawDevice(g, y, "GPU", s.GpuName, new[]
         {
             TempTile(r.GpuTemp, set.GpuWarn, set.GpuHot),
-            new Tile("Usage", Num(r.GpuLoad, "0"), Suffix: "%"),
-            new Tile("Power", Num(r.GpuPower, "0"), Suffix: " W"),
-            new Tile("Mem clock", Num(r.GpuMemClock / 1000, "0.0"), Suffix: " GHz"),
+            PercentTile(L.Usage, r.GpuLoad),
+            new Tile(L.Power, Num(r.GpuPower, "0"), Suffix: " W"),
+            new Tile(L.MemClock, Num(r.GpuMemClock / 1000, "0.0"), Suffix: " GHz"),
         });
 
-        y += Pf(22);
-        y = DrawChart(g, y, TempChart, s.History);
+        y = Divider(g, y + Pf(16));
+        y = DrawRangeSelector(g, y, set.HistoryRange);
+        y = DrawChart(g, y, L.Temperature, TempChart, s);
         y += Pf(18);
-        y = DrawChart(g, y, LoadChart, s.History);
+        y = DrawChart(g, y, L.Usage, LoadChart, s);
         y = Divider(g, y + Pf(14));
         y = DrawSystem(g, y, r);
         y = Divider(g, y + Pf(10));
@@ -313,13 +327,16 @@ internal sealed class DetailPanel : Form
         return y + pad;
     }
 
-    private static string Num(float? v, string format) => v is float f ? f.ToString(format, Inv) : "--";
+    private static string Num(float? v, string format) => v is float f ? L.Number(f, format) : "--";
+
+    private static Tile PercentTile(string label, float? v) =>
+        L.Turkish ? new Tile(label, Num(v, "0"), Prefix: "%") : new Tile(label, Num(v, "0"), Suffix: "%");
 
     private static Tile TempTile(float? temp, int warn, int hot) => temp switch
     {
-        float t when t >= hot => new Tile("Critical", Num(t, "0"), Suffix: "°C", Status: Theme.Critical),
-        float t when t >= warn => new Tile("High", Num(t, "0"), Suffix: "°C", Status: Theme.Warning),
-        _ => new Tile("Temp", Num(temp, "0"), Suffix: "°C"),
+        float t when t >= hot => new Tile(L.Critical, Num(t, "0"), Suffix: "°C", Status: Theme.Critical),
+        float t when t >= warn => new Tile(L.High, Num(t, "0"), Suffix: "°C", Status: Theme.Warning),
+        _ => new Tile(L.Temp, Num(temp, "0"), Suffix: "°C"),
     };
 
     private float Divider(Graphics g, float y)
@@ -378,31 +395,59 @@ internal sealed class DetailPanel : Form
             TextAt(g, tile.Suffix, _fSmall!, _theme.TextSecondary, x + TextWidth(g, tile.Value, _fValue!) + Pf(1), valueBase);
     }
 
-    // ---------------------------------------------------------------- charts
+    // ---------------------------------------------------------------- history charts
 
-    private float DrawChart(Graphics g, float y, ChartSpec spec, IReadOnlyList<Sample> samples)
+    private float DrawRangeSelector(Graphics g, float y, HistoryRange current)
+    {
+        float pad = Pf(PadDip), right = Pf(WidthDip - PadDip), h = Pf(26);
+        TextAt(g, L.History, _fTitle!, _theme.Text, pad, y + h / 2 + Ascent(_fTitle!) / 2 - Pf(1));
+
+        var ranges = Enum.GetValues<HistoryRange>();
+        float segW = Pf(56), total = segW * ranges.Length;
+        var box = new RectangleF(right - total, y, total, h);
+        Fill(g, box, Pf(6), _theme.Raised);
+        for (int i = 0; i < ranges.Length; i++)
+        {
+            var range = ranges[i];
+            var seg = new RectangleF(box.Left + i * segW, box.Top, segW, h);
+            _rangeButtons[range] = seg;
+            bool selected = range == current;
+            if (selected || Hovered(seg))
+                Fill(g, RectangleF.Inflate(seg, -Pf(2), -Pf(2)), Pf(5), selected ? _theme.RaisedHover : Color.FromArgb(_theme.Light ? 10 : 14, _theme.Text));
+            TextAt(g, L.RangeName(range), selected ? _fTitle! : _fSmall!, selected ? _theme.Text : _theme.TextSecondary,
+                seg.Left + segW / 2, seg.Top + h / 2 + Ascent(_fSmall!) / 2 - Pf(1), Center);
+            if (!selected) _buttons.Add((seg, () => RangeChanged?.Invoke(range), true));
+        }
+        return y + h + Pf(14);
+    }
+
+    private float DrawChart(Graphics g, float y, string title, ChartSpec spec, PanelState s)
     {
         float pad = Pf(PadDip), width = Pf(WidthDip);
+        var range = s.Settings.HistoryRange;
 
         // Title row with the legend on the right (two series → legend always present).
         float baseline = y + Ascent(_fTitle!);
-        TextAt(g, spec.Title, _fTitle!, _theme.Text, pad, baseline);
-        TextAt(g, "last 10 min", _fSmall!, _theme.TextMuted, pad + TextWidth(g, spec.Title, _fTitle!) + Pf(6), baseline);
+        TextAt(g, title, _fTitle!, _theme.Text, pad, baseline);
         float lx = LegendItem(g, width - pad, baseline, "GPU", _theme.Gpu);
         LegendItem(g, lx - Pf(14), baseline, "CPU", _theme.Cpu);
         y += Pf(24);
 
         float axisW = Pf(30), endW = Pf(34);
         var plot = new RectangleF(pad + axisW, y + Pf(4), width - 2 * pad - axisW - endW, Pf(84));
-        if (spec == TempChart) _tempPlot = plot;
+        _plots.Add(plot);
 
-        DateTime end = samples.Count > 0 ? samples[^1].Time : DateTime.Now;
-        DateTime start = end - SampleHistory.Window;
+        TimeSpan span = range switch { HistoryRange.Hour => TimeSpan.FromHours(1), HistoryRange.Day => TimeSpan.FromHours(24), _ => TimeSpan.FromMinutes(10) };
+        DateTime end = s.History.Count > 0 ? s.History[^1].Time : DateTime.Now;
+        DateTime start = end - span;
+        var (cpu, gpu) = Buckets(spec, s, range, start, span, (int)plot.Width);
+        TimeSpan bucketSpan = span / cpu.Length;
+
         var (min, max, step) = spec.Percent
             ? (0f, 100f, 50f)
-            : NiceRange(samples.SelectMany(p => new[] { spec.Cpu(p.Reading), spec.Gpu(p.Reading) }));
+            : NiceRange(cpu.Concat(gpu).Where(b => b.Has).SelectMany(b => new[] { b.Min, b.Max }));
         float Y(float v) => plot.Bottom - (Math.Clamp(v, min, max) - min) / (max - min) * plot.Height;
-        float X(DateTime t) => plot.Left + (float)((t - start).TotalMilliseconds / SampleHistory.Window.TotalMilliseconds) * plot.Width;
+        float X(int i) => plot.Left + (i + 0.5f) * plot.Width / cpu.Length;
 
         // Recessive hairline grid + y ticks.
         using (var grid = new Pen(_theme.Grid, 1f))
@@ -411,41 +456,117 @@ internal sealed class DetailPanel : Form
             {
                 float gy = MathF.Round(Y(v)) + 0.5f;
                 g.DrawLine(grid, plot.Left, gy, plot.Right, gy);
-                string tick = spec.Percent ? $"{v:0}%" : $"{v:0}°";
+                string tick = spec.Percent ? L.Percent(v) : $"{v:0}°";
                 TextAt(g, tick, _fAxis!, _theme.TextMuted, plot.Left - Pf(6), gy + Ascent(_fAxis!) / 2 - Pf(1), Far);
             }
         }
 
         float xBase = plot.Bottom + Pf(6) + Ascent(_fAxis!);
-        TextAt(g, "10 min ago", _fAxis!, _theme.TextMuted, plot.Left, xBase);
-        TextAt(g, "5 min", _fAxis!, _theme.TextMuted, plot.Left + plot.Width / 2, xBase, Center);
-        TextAt(g, "now", _fAxis!, _theme.TextMuted, plot.Right, xBase, Far);
+        TextAt(g, L.RangeStart(range), _fAxis!, _theme.TextMuted, plot.Left, xBase);
+        TextAt(g, L.RangeMiddle(range), _fAxis!, _theme.TextMuted, plot.Left + plot.Width / 2, xBase, Center);
+        TextAt(g, L.Now, _fAxis!, _theme.TextMuted, plot.Right, xBase, Far);
 
         var state = g.Save();
         g.SetClip(RectangleF.Inflate(plot, Pf(2), Pf(2)));
-        DrawSeries(g, samples, spec.Cpu, _theme.Cpu, X, Y);
-        DrawSeries(g, samples, spec.Gpu, _theme.Gpu, X, Y);
+        DrawSeries(g, cpu, _theme.Cpu, X, Y, bucketSpan);
+        DrawSeries(g, gpu, _theme.Gpu, X, Y, bucketSpan);
         g.Restore(state);
 
-        if (samples.Count > 0)
-        {
-            var last = samples[^1];
-            float? cpu = spec.Cpu(last.Reading), gpu = spec.Gpu(last.Reading);
-            if (cpu is float c) Dot(g, X(last.Time), Y(c), _theme.Cpu);
-            if (gpu is float gv) Dot(g, X(last.Time), Y(gv), _theme.Gpu);
+        int lastCpu = Array.FindLastIndex(cpu, b => b.Has), lastGpu = Array.FindLastIndex(gpu, b => b.Has);
+        if (lastCpu >= 0) Dot(g, X(lastCpu), Y(cpu[lastCpu].Avg), _theme.Cpu);
+        if (lastGpu >= 0) Dot(g, X(lastGpu), Y(gpu[lastGpu].Avg), _theme.Gpu);
 
-            // End labels, unless they would collide - then legend + tooltip carry it.
-            if (cpu is float c2 && gpu is float g2 && Math.Abs(Y(c2) - Y(g2)) >= _fAxis!.Size + Pf(3))
-            {
-                EndLabel(g, plot, Y(c2), Format(spec, c2));
-                EndLabel(g, plot, Y(g2), Format(spec, g2));
-            }
+        // End labels, unless they would collide - then legend + tooltip carry it.
+        if (lastCpu >= 0 && lastGpu >= 0 && Math.Abs(Y(cpu[lastCpu].Avg) - Y(gpu[lastGpu].Avg)) >= _fAxis!.Size + Pf(3))
+        {
+            EndLabel(g, plot, Y(cpu[lastCpu].Avg), Format(spec, cpu[lastCpu].Avg));
+            EndLabel(g, plot, Y(gpu[lastGpu].Avg), Format(spec, gpu[lastGpu].Avg));
         }
 
-        if (_mouse is Point m && plot.Contains(m) && samples.Count > 0)
-            DrawHover(g, plot, spec, samples, X, Y, m);
+        if (_mouse is Point m && plot.Contains(m))
+            DrawHover(g, plot, spec, range, cpu, gpu, X, Y, m);
 
         return xBase + Pf(4);
+    }
+
+    /// <summary>
+    /// Folds the raw data into one bucket per pixel column (never more buckets than samples), so an hour of
+    /// per-second readings or a day of per-minute aggregates both draw as a clean line with a min–max band.
+    /// </summary>
+    private static (Bucket[] Cpu, Bucket[] Gpu) Buckets(ChartSpec spec, PanelState s, HistoryRange range, DateTime start, TimeSpan span, int pixels)
+    {
+        double sampleSeconds = range == HistoryRange.Day ? 60 : s.Settings.IntervalMs / 1000.0;
+        int count = Math.Clamp((int)(span.TotalSeconds / sampleSeconds), 1, Math.Max(1, pixels));
+
+        IEnumerable<(DateTime T, float Avg, float Min, float Max)> Points(bool gpu) => range == HistoryRange.Day
+            ? s.Minutes
+                .Select(m => (m.Time.AddSeconds(30), gpu ? spec.GpuMinute(m) : spec.CpuMinute(m)))
+                .Where(p => p.Item2.HasValue)
+                .Select(p => (p.Item1, p.Item2!.Value.Avg, p.Item2.Value.Min, p.Item2.Value.Max))
+            : s.History
+                .Select(h => (h.Time, gpu ? spec.Gpu(h.Reading) : spec.Cpu(h.Reading)))
+                .Where(p => p.Item2.HasValue)
+                .Select(p => (p.Time, p.Item2!.Value, p.Item2.Value, p.Item2.Value));
+
+        return (Fold(Points(false), start, span, count), Fold(Points(true), start, span, count));
+    }
+
+    private static Bucket[] Fold(IEnumerable<(DateTime T, float Avg, float Min, float Max)> points, DateTime start, TimeSpan span, int count)
+    {
+        var sum = new double[count];
+        var n = new int[count];
+        var min = new float[count];
+        var max = new float[count];
+        Array.Fill(min, float.MaxValue);
+        Array.Fill(max, float.MinValue);
+
+        foreach (var p in points)
+        {
+            if (p.T < start) continue;
+            int i = Math.Min(count - 1, (int)((p.T - start).Ticks * count / span.Ticks));
+            sum[i] += p.Avg;
+            n[i]++;
+            min[i] = Math.Min(min[i], p.Min);
+            max[i] = Math.Max(max[i], p.Max);
+        }
+
+        var buckets = new Bucket[count];
+        for (int i = 0; i < count; i++)
+        {
+            var time = start + span * ((i + 0.5) / count);
+            buckets[i] = n[i] > 0 ? new Bucket(time, (float)(sum[i] / n[i]), min[i], max[i], true) : new Bucket(time, 0, 0, 0, false);
+        }
+        return buckets;
+    }
+
+    private void DrawSeries(Graphics g, Bucket[] buckets, Color color, Func<int, float> x, Func<float, float> y, TimeSpan bucketSpan)
+    {
+        // Bridge a few empty columns (sampling jitter) but break the line on real pauses (sleep, app restart).
+        int maxGap = Math.Max(3, (int)Math.Ceiling(TimeSpan.FromSeconds(30) / bucketSpan));
+        using var band = new SolidBrush(Color.FromArgb(26, color));
+        using var pen = new Pen(color, Pf(2)) { LineJoin = LineJoin.Round, StartCap = LineCap.Round, EndCap = LineCap.Round };
+
+        var run = new List<int>();
+        void Flush()
+        {
+            if (run.Count >= 2)
+            {
+                var outline = run.Select(i => new PointF(x(i), y(buckets[i].Max)))
+                    .Concat(run.AsEnumerable().Reverse().Select(i => new PointF(x(i), y(buckets[i].Min))))
+                    .ToArray();
+                g.FillPolygon(band, outline);
+                g.DrawLines(pen, run.Select(i => new PointF(x(i), y(buckets[i].Avg))).ToArray());
+            }
+            run.Clear();
+        }
+
+        for (int i = 0; i < buckets.Length; i++)
+        {
+            if (!buckets[i].Has) continue;
+            if (run.Count > 0 && i - run[^1] > maxGap) Flush();
+            run.Add(i);
+        }
+        Flush();
     }
 
     private float LegendItem(Graphics g, float right, float baseline, string label, Color color)
@@ -461,32 +582,7 @@ internal sealed class DetailPanel : Form
     private void EndLabel(Graphics g, RectangleF plot, float y, string text) =>
         TextAt(g, text, _fAxis!, _theme.TextSecondary, plot.Right + Pf(9), y + Ascent(_fAxis!) / 2 - Pf(1));
 
-    private static string Format(ChartSpec spec, float? v) =>
-        v is not float f ? "--" : spec.Percent ? $"{f:0}%" : $"{f:0}°C";
-
-    private void DrawSeries(Graphics g, IReadOnlyList<Sample> samples, Func<Reading, float?> value, Color color,
-        Func<DateTime, float> x, Func<float, float> y)
-    {
-        using var pen = new Pen(color, Pf(2)) { LineJoin = LineJoin.Round, StartCap = LineCap.Round, EndCap = LineCap.Round };
-        var points = new List<PointF>(samples.Count);
-        DateTime? previous = null;
-
-        void Flush()
-        {
-            if (points.Count >= 2) g.DrawLines(pen, points.ToArray());
-            points.Clear();
-        }
-
-        foreach (var sample in samples)
-        {
-            var v = value(sample.Reading);
-            // Break the line on missing values or pauses (sleep, sensor restart) instead of bridging them.
-            if (v is null || (previous is DateTime p && sample.Time - p > TimeSpan.FromSeconds(10))) Flush();
-            if (v is float f) points.Add(new PointF(x(sample.Time), y(f)));
-            previous = sample.Time;
-        }
-        Flush();
-    }
+    private static string Format(ChartSpec spec, float v) => spec.Percent ? L.Percent(v) : $"{v:0}°C";
 
     private void Dot(Graphics g, float x, float y, Color color)
     {
@@ -496,30 +592,37 @@ internal sealed class DetailPanel : Form
         g.FillEllipse(brush, x - dot, y - dot, 2 * dot, 2 * dot);
     }
 
-    private void DrawHover(Graphics g, RectangleF plot, ChartSpec spec, IReadOnlyList<Sample> samples,
-        Func<DateTime, float> X, Func<float, float> Y, Point mouse)
+    private void DrawHover(Graphics g, RectangleF plot, ChartSpec spec, HistoryRange range, Bucket[] cpu, Bucket[] gpu,
+        Func<int, float> X, Func<float, float> Y, Point mouse)
     {
-        var best = samples[0];
+        int best = -1;
         float bestDistance = float.MaxValue;
-        foreach (var sample in samples)
+        for (int i = 0; i < cpu.Length; i++)
         {
-            float d = Math.Abs(X(sample.Time) - mouse.X);
-            if (d < bestDistance) { bestDistance = d; best = sample; }
+            if (!cpu[i].Has && !gpu[i].Has) continue;
+            float d = Math.Abs(X(i) - mouse.X);
+            if (d < bestDistance) { bestDistance = d; best = i; }
         }
+        if (best < 0) return;
 
-        float x = X(best.Time);
+        float x = X(best);
         using (var cross = new Pen(_theme.TextMuted, 1f))
             g.DrawLine(cross, x, plot.Top, x, plot.Bottom);
-        float? cpu = spec.Cpu(best.Reading), gpu = spec.Gpu(best.Reading);
-        if (cpu is float c) Dot(g, x, Y(c), _theme.Cpu);
-        if (gpu is float gv) Dot(g, x, Y(gv), _theme.Gpu);
+        if (cpu[best].Has) Dot(g, x, Y(cpu[best].Avg), _theme.Cpu);
+        if (gpu[best].Has) Dot(g, x, Y(gpu[best].Avg), _theme.Gpu);
 
-        string time = best.Time.ToString("HH:mm:ss", Inv);
-        string cpuText = Format(spec, cpu), gpuText = Format(spec, gpu);
+        // Longer ranges average many samples per column, so also show the peak that the average hides.
+        bool showMax = range != HistoryRange.TenMinutes;
+        string time = cpu[best].Time.ToString(range == HistoryRange.Day ? "HH:mm" : "HH:mm:ss", L.Culture);
+        var rows = new[] { ("CPU", cpu[best], _theme.Cpu), ("GPU", gpu[best], _theme.Gpu) };
+        string Value(Bucket b) => b.Has ? Format(spec, b.Avg) : "--";
+        string Peak(Bucket b) => showMax && b.Has ? $"{L.MaxShort} {Format(spec, b.Max)}" : "";
+
         float lineH = Pf(17), boxPad = Pf(8), key = Pf(10);
-        float labelW = Math.Max(TextWidth(g, "CPU", _fSmall!), TextWidth(g, "GPU", _fSmall!));
-        float valueW = Math.Max(TextWidth(g, cpuText, _fTitle!), TextWidth(g, gpuText, _fTitle!));
-        float boxW = Math.Max(TextWidth(g, time, _fSmall!), key + Pf(6) + labelW + Pf(12) + valueW) + 2 * boxPad;
+        float labelW = rows.Max(r => TextWidth(g, r.Item1, _fSmall!));
+        float valueW = rows.Max(r => TextWidth(g, Value(r.Item2), _fTitle!));
+        float peakW = rows.Max(r => TextWidth(g, Peak(r.Item2), _fSmall!));
+        float boxW = Math.Max(TextWidth(g, time, _fSmall!), key + Pf(6) + labelW + Pf(12) + valueW + (peakW > 0 ? Pf(8) + peakW : 0)) + 2 * boxPad;
         float boxH = 3 * lineH + 2 * boxPad - Pf(4);
 
         float bx = x + Pf(12);
@@ -532,24 +635,25 @@ internal sealed class DetailPanel : Form
 
         float row = box.Top + boxPad + Ascent(_fSmall!);
         TextAt(g, time, _fSmall!, _theme.TextSecondary, box.Left + boxPad, row);
-        foreach (var (label, text, color) in new[] { ("CPU", cpuText, _theme.Cpu), ("GPU", gpuText, _theme.Gpu) })
+        float valueRight = box.Left + boxPad + key + Pf(6) + labelW + Pf(12) + valueW;
+        foreach (var (label, bucket, color) in rows)
         {
             row += lineH;
             using (var pen = new Pen(color, Pf(2)) { StartCap = LineCap.Round, EndCap = LineCap.Round })
                 g.DrawLine(pen, box.Left + boxPad, row - Pf(4), box.Left + boxPad + key, row - Pf(4));
             TextAt(g, label, _fSmall!, _theme.TextSecondary, box.Left + boxPad + key + Pf(6), row);
-            TextAt(g, text, _fTitle!, _theme.Text, box.Right - boxPad, row, Far);
+            TextAt(g, Value(bucket), _fTitle!, _theme.Text, valueRight, row, Far);
+            if (peakW > 0) TextAt(g, Peak(bucket), _fSmall!, _theme.TextMuted, valueRight + Pf(8), row);
         }
     }
 
-    private static (float Min, float Max, float Step) NiceRange(IEnumerable<float?> values)
+    private static (float Min, float Max, float Step) NiceRange(IEnumerable<float> values)
     {
         float lo = float.MaxValue, hi = float.MinValue;
         foreach (var v in values)
         {
-            if (v is not float f) continue;
-            lo = Math.Min(lo, f);
-            hi = Math.Max(hi, f);
+            lo = Math.Min(lo, v);
+            hi = Math.Max(hi, v);
         }
         if (lo > hi) (lo, hi) = (30, 70);
 
@@ -570,15 +674,19 @@ internal sealed class DetailPanel : Form
 
     private float DrawSystem(Graphics g, float y, Reading r)
     {
-        y = SectionTitle(g, y, "System");
+        y = SectionTitle(g, y, L.System);
         var items = new List<(string Label, string Value)>();
-        if (r.SocVoltage is float soc) items.Add(("SoC voltage", $"{soc.ToString("0.00", Inv)} V"));
-        if (r.CoreVoltage is float vcore) items.Add(("Vcore", $"{vcore.ToString("0.00", Inv)} V"));
+        if (r.SocVoltage is float soc) items.Add((L.SocVoltage, $"{L.Number(soc, "0.00")} V"));
+        if (r.CoreVoltage is float vcore) items.Add(("Vcore", $"{L.Number(vcore, "0.00")} V"));
         if (r.RamUsedGb is float used && r.RamTotalGb is float total)
-            items.Add(("RAM", $"{used.ToString("0.0", Inv)} / {total.ToString("0", Inv)} GB"));
-        if (r.GpuMemTemp is float vram) items.Add(("GPU memory", $"{vram:0}°C"));
-        foreach (var (name, rpm) in r.Fans) items.Add((FanName(name), $"{rpm:0} rpm"));
-        if (items.Count == 0) items.Add(("Sensors", "need admin rights"));
+            items.Add(("RAM", $"{L.Number(used, "0.0")} / {L.Number(total, "0")} GB"));
+        if (r.GpuMemTemp is float vram) items.Add((L.GpuMemory, $"{vram:0}°C"));
+        if (r.NetDown is float down) items.Add((L.Download, L.Rate(down)));
+        if (r.NetUp is float up) items.Add((L.Upload, L.Rate(up)));
+        if (r.DiskRead is float read) items.Add((L.DiskRead, L.Rate(read)));
+        if (r.DiskWrite is float write) items.Add((L.DiskWrite, L.Rate(write)));
+        foreach (var (name, rpm) in r.Fans) items.Add((L.FanName(name), $"{rpm:0} rpm"));
+        if (r.SocVoltage is null && r.Fans.Count == 0) items.Add((L.Sensors, L.NeedAdmin));
 
         float pad = Pf(PadDip), colGap = Pf(24), colW = (Pf(WidthDip) - 2 * pad - colGap) / 2, rowH = Pf(20);
         for (int i = 0; i < items.Count; i++)
@@ -591,52 +699,42 @@ internal sealed class DetailPanel : Form
         return y + (items.Count + 1) / 2 * rowH;
     }
 
-    private static string FanName(string name) => name switch
-    {
-        "CPU Fan" => "CPU fan",
-        "Chipset Fan" => "Chipset fan",
-        _ when name.StartsWith("System Fan") => "Case fan" + name["System Fan".Length..].Replace("#", ""),
-        _ when name.StartsWith("Pump Fan") => "Pump" + name["Pump Fan".Length..].Replace("#", ""),
-        _ => name,
-    };
-
     private float DrawStability(Graphics g, float y, PanelState s)
     {
         float pad = Pf(PadDip), right = Pf(WidthDip - PadDip);
         float titleBase = y + Ascent(_fTitle!);
-        TextAt(g, "Stability", _fTitle!, _theme.Text, pad, titleBase);
+        TextAt(g, L.Stability, _fTitle!, _theme.Text, pad, titleBase);
         if (s.Events.Count > 0)
-            TextButton(g, right, titleBase, "Mark as seen", () => StabilityAckClicked?.Invoke());
+            TextButton(g, right, titleBase, L.MarkSeen, () => StabilityAckClicked?.Invoke());
         y += Pf(26);
 
         Color color;
         string headline;
-        if (!s.StabilityAvailable) (color, headline) = (Theme.Warning, "Event log unavailable");
-        else if (s.Events.Count == 0) (color, headline) = (Theme.Good, "No hardware errors");
-        else (color, headline) = (s.Events.Any(e => e.Serious) ? Theme.Critical : Theme.Warning, $"{s.Events.Count} event{(s.Events.Count == 1 ? "" : "s")} logged");
+        if (!s.StabilityAvailable) (color, headline) = (Theme.Warning, L.EventLogUnavailable);
+        else if (s.Events.Count == 0) (color, headline) = (Theme.Good, L.NoHardwareErrors);
+        else (color, headline) = (s.Events.Any(e => e.Serious) ? Theme.Critical : Theme.Warning, L.EventsLogged(s.Events.Count));
 
         float icon = Pf(16), baseline = y + Ascent(_fText!);
         var iconRect = new RectangleF(pad, baseline - Ascent(_fText!) / 2 - icon / 2 - Pf(1), icon, icon);
         StatusIcon(g, iconRect, color, ok: s.StabilityAvailable && s.Events.Count == 0);
         float tx = pad + icon + Pf(8);
         TextAt(g, headline, _fText!, _theme.Text, tx, baseline);
-        string scope = s.StabilityAckTime is DateTime ack ? $"· since {ack.ToString("MMM d, HH:mm", Inv)}" : "· last 7 days";
+        string scope = s.StabilityAckTime is DateTime ack ? L.Since(ack) : L.LastSevenDays;
         TextAt(g, scope, _fSmall!, _theme.TextMuted, tx + TextWidth(g, headline, _fText!) + Pf(6), baseline);
         y += Pf(24);
 
+        float whenW = TextWidth(g, L.When(new DateTime(2026, 12, 28, 20, 58, 0)), _fSmall!);
         foreach (var ev in s.Events.Take(3))
         {
-            float rowBase = y + Ascent(_fSmall!);
-            string when = ev.Time.ToString("MMM d, HH:mm", Inv);
-            TextAt(g, when, _fSmall!, _theme.TextMuted, tx, rowBase);
-            float titleX = tx + TextWidth(g, "Sep 00, 00:00", _fSmall!) + Pf(8);
+            TextAt(g, L.When(ev.Time), _fSmall!, _theme.TextMuted, tx, y + Ascent(_fSmall!));
+            float titleX = tx + whenW + Pf(8);
             using (var brush = new SolidBrush(_theme.TextSecondary))
                 g.DrawString(ev.Title, _fSmall!, brush, new RectangleF(titleX, y, right - titleX, Pf(16)), NearTrim);
             y += Pf(18);
         }
         if (s.Events.Count > 3)
         {
-            TextAt(g, $"+{s.Events.Count - 3} more", _fSmall!, _theme.TextMuted, tx, y + Ascent(_fSmall!));
+            TextAt(g, L.More(s.Events.Count - 3), _fSmall!, _theme.TextMuted, tx, y + Ascent(_fSmall!));
             y += Pf(18);
         }
         return y;
@@ -671,8 +769,7 @@ internal sealed class DetailPanel : Form
     {
         float w = TextWidth(g, text, _fSmall!) + Pf(12), h = Pf(22);
         var rect = new RectangleF(right - w, baseline - Ascent(_fSmall!) / 2 - h / 2 - Pf(1), w, h);
-        bool hover = _mouse is Point m && rect.Contains(m);
-        Fill(g, rect, Pf(4), hover ? _theme.RaisedHover : _theme.Raised);
+        Fill(g, rect, Pf(4), Hovered(rect) ? _theme.RaisedHover : _theme.Raised);
         TextAt(g, text, _fSmall!, _theme.Text, rect.Left + rect.Width / 2, baseline, Center);
         _buttons.Add((rect, click, true));
     }
@@ -682,19 +779,19 @@ internal sealed class DetailPanel : Form
         static string Max((float Value, DateTime At)? m) => m is { } v ? $"{v.Value:0}°C ({v.At:HH:mm})" : "--";
 
         float pad = Pf(PadDip), inner = Pf(WidthDip - 2 * PadDip);
-        TextAt(g, $"Max CPU {Max(s.MaxCpu)}   ·   GPU {Max(s.MaxGpu)}", _fSmall!, _theme.TextSecondary, pad, y + Ascent(_fSmall!));
+        TextAt(g, L.FooterMax(Max(s.MaxCpu), Max(s.MaxGpu)), _fSmall!, _theme.TextSecondary, pad, y + Ascent(_fSmall!));
         y += Pf(24);
 
         float gap = Pf(8), w = (inner - 2 * gap) / 3, h = Pf(32);
-        Button(g, new RectangleF(pad, y, w, h), "Task Manager", () => TaskManagerClicked?.Invoke(), true);
-        Button(g, new RectangleF(pad + w + gap, y, w, h), "Spike log", () => SpikeLogClicked?.Invoke(), s.SpikeLogExists);
-        Button(g, new RectangleF(pad + 2 * (w + gap), y, w, h), "Settings", () => SettingsClicked?.Invoke(), true);
+        Button(g, new RectangleF(pad, y, w, h), L.TaskManager, () => TaskManagerClicked?.Invoke(), true);
+        Button(g, new RectangleF(pad + w + gap, y, w, h), L.SpikeLog, () => SpikeLogClicked?.Invoke(), s.SpikeLogExists);
+        Button(g, new RectangleF(pad + 2 * (w + gap), y, w, h), L.Settings, () => SettingsClicked?.Invoke(), true);
         return y + h;
     }
 
     private void Button(Graphics g, RectangleF rect, string text, Action click, bool enabled)
     {
-        bool hover = enabled && _mouse is Point m && rect.Contains(m);
+        bool hover = enabled && Hovered(rect);
         Fill(g, rect, Pf(5), hover ? _theme.RaisedHover : _theme.Raised);
         float baseline = rect.Top + rect.Height / 2 + Ascent(_fText!) / 2 - Pf(1);
         TextAt(g, text, _fText!, enabled ? _theme.Text : _theme.TextMuted, rect.Left + rect.Width / 2, baseline, Center);

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace TaskbarThermals;
 
@@ -19,9 +20,13 @@ internal sealed class Settings
     /// <summary>Distance (in 96-DPI units) between the overlay's right edge and the taskbar's right edge. Null = automatic.</summary>
     public int? OffsetFromRight { get; set; }
 
-    // Taskbar overlay
-    public bool ShowLoad { get; set; } = true;
-    public bool ShowPower { get; set; }
+    // Taskbar overlay: ids from <see cref="Metrics.All"/>. Null only when read from a pre-1.1 settings file.
+    public List<string>? Metrics { get; set; }
+
+    // Pre-1.1 settings, only read to migrate into <see cref="Metrics"/>.
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public bool? ShowLoad { get; set; }
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] public bool? ShowPower { get; set; }
+
     public int FontSize { get; set; } = 12;
     public int IntervalMs { get; set; } = 1000;
 
@@ -42,6 +47,14 @@ internal sealed class Settings
     // Spike log: rise within 5 s that counts as a spike.
     public int SpikeJump { get; set; } = 10;
 
+    // General
+    public string Language { get; set; } = "auto";   // auto | en | tr
+    public bool CheckUpdates { get; set; } = true;
+    public HistoryRange HistoryRange { get; set; } = HistoryRange.TenMinutes;
+
+    /// <summary>Newest version the user was already told about, so each update is announced once.</summary>
+    public string? UpdateNotified { get; set; }
+
     /// <summary>Stability events up to this moment were acknowledged by the user ("Mark as seen").</summary>
     public DateTime? StabilityAckTime { get; set; }
 
@@ -52,8 +65,18 @@ internal sealed class Settings
 
     public static Settings Load()
     {
-        try { return JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new(); }
-        catch { return new(); }
+        Settings s;
+        try { s = JsonSerializer.Deserialize<Settings>(File.ReadAllText(FilePath)) ?? new(); }
+        catch { s = new(); }
+
+        if (s.Metrics == null)
+        {
+            s.Metrics = new() { "cpu.temp", "gpu.temp" };
+            if (s.ShowLoad ?? true) s.Metrics.AddRange(new[] { "cpu.load", "gpu.load" });
+            if (s.ShowPower == true) s.Metrics.AddRange(new[] { "cpu.power", "gpu.power" });
+            s.ShowLoad = s.ShowPower = null;
+        }
+        return s;
     }
 
     public void Save()
