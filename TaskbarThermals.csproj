@@ -23,6 +23,12 @@
     <Copyright>Copyright (c) 2026 Quenchh</Copyright>
   </PropertyGroup>
 
+  <!-- Keep local file paths (and so the builder's user name) out of published binaries. -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>none</DebugType>
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
   <ItemGroup>
     <EmbeddedResource Include="icon.ico" LogicalName="TaskbarThermals.icon.ico" />
   </ItemGroup>
