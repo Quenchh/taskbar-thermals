@@ -1,0 +1,77 @@
+# Push a tag like v1.2.0 and this builds both executables on GitHub's runners and publishes the release.
+# Release notes come from the matching "## 1.2.0" section of CHANGELOG.md plus the download table and checksums.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          $common = @('-c', 'Release', '-p:PublishSingleFile=true', '-p:IncludeNativeLibrariesForSelfExtract=true', "-p:Version=$version", '--nologo')
+          dotnet publish TaskbarThermals.csproj @common -o out/fd
+          if ($LASTEXITCODE) { exit 1 }
+          dotnet publish TaskbarThermals.csproj @common --self-contained true -p:EnableCompressionInSingleFile=true -o out/sc
+          if ($LASTEXITCODE) { exit 1 }
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item out/fd/TaskbarThermals.exe dist/TaskbarThermals.exe
+          Copy-Item out/sc/TaskbarThermals.exe dist/TaskbarThermals-standalone.exe
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $version = $tag.TrimStart('v')
+
+          # "## <version>" section of the changelog, up to the next "## ".
+          $changelog = Get-Content CHANGELOG.md -Raw
+          $match = [regex]::Match($changelog, "(?ms)^## $([regex]::Escape($version))\b[^\n]*\n(.*?)(?=^## |\z)")
+          $changes = if ($match.Success) { $match.Groups[1].Value.Trim() } else { '' }
+
+          function Info($file) {
+            $item = Get-Item "dist/$file"
+            [pscustomobject]@{ Mb = [math]::Round($item.Length / 1MB, 1); Sha = (Get-FileHash $item.FullName -Algorithm SHA256).Hash.ToLower() }
+          }
+          $fd = Info 'TaskbarThermals.exe'
+          $sc = Info 'TaskbarThermals-standalone.exe'
+
+          $notes = @(
+            $changes
+            ''
+            '### Downloads'
+            ''
+            '| File | Size | Needs |'
+            '|---|---|---|'
+            "| ``TaskbarThermals.exe`` | $($fd.Mb) MB | [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) |"
+            "| ``TaskbarThermals-standalone.exe`` | $($sc.Mb) MB | nothing |"
+            ''
+            'The exe isn''t code-signed, so Windows SmartScreen may warn on first run: *More info → Run anyway*. CPU temperature needs administrator rights and the [PawnIO](https://pawnio.eu) driver.'
+            ''
+            '### SHA-256'
+            ''
+            '```'
+            "$($fd.Sha)  TaskbarThermals.exe"
+            "$($sc.Sha)  TaskbarThermals-standalone.exe"
+            '```'
+            ''
+            'Built by GitHub Actions from this tag.'
+          ) -join "`n"
+          Set-Content release-notes.md $notes -Encoding utf8NoBOM
+
+          gh release create $tag dist/TaskbarThermals.exe dist/TaskbarThermals-standalone.exe --title "Taskbar Thermals $version" --notes-file release-notes.md --verify-tag
